@@ -1,0 +1,6 @@
+{
+  "name": "5-Day Meal Plan Coach",
+  "description": "Personalized, high-protein 5-day meal plans with smart prep strategies and consolidated grocery lists.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
