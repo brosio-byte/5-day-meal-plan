@@ -30,53 +30,27 @@ export interface ParsedPlan {
   rawMarkdown: string;
 }
 
-export function parseMealPlanMarkdown(markdown: string): ParsedPlan {
-  const result: ParsedPlan = {
-    intro: "",
-    days: [],
-    prepStrategy: [],
-    groceryList: [],
-    rawMarkdown: markdown,
-  };
+export function parseMealsSection(markdown: string): { intro: string; days: ParsedDay[] } {
+  if (!markdown) return { intro: "", days: [] };
 
-  if (!markdown) return result;
-
-  // Split into major sections
   const lines = markdown.split("\n");
-  let currentSection: "intro" | "plan" | "prep" | "grocery" = "intro";
-  let introLines: string[] = [];
-  let prepLines: string[] = [];
-  let groceryLines: string[] = [];
+  const introLines: string[] = [];
+  let foundFirstDay = false;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+  for (const line of lines) {
     const trimmed = line.trim();
-
-    if (/^#+\s*(?:Your\s+)?5-Day\s+Meal\s+Plan/i.test(trimmed)) {
-      currentSection = "plan";
-      continue;
-    } else if (/^#+\s*Prep\s+Once/i.test(trimmed) || /^#+\s*Prep\s+Strategy/i.test(trimmed)) {
-      currentSection = "prep";
-      continue;
-    } else if (/^#+\s*(?:Your\s+)?(?:5-Day\s+)?Grocery\s+List/i.test(trimmed)) {
-      currentSection = "grocery";
-      continue;
+    if (/^##\s*Day\s*1/i.test(trimmed)) {
+      foundFirstDay = true;
+      break;
     }
-
-    if (currentSection === "intro") {
-      if (trimmed && !trimmed.startsWith("#")) {
-        introLines.push(trimmed);
-      }
-    } else if (currentSection === "prep") {
-      if (trimmed) prepLines.push(trimmed);
-    } else if (currentSection === "grocery") {
-      if (trimmed) groceryLines.push(trimmed);
+    if (trimmed && !trimmed.startsWith("#") && !foundFirstDay) {
+      introLines.push(trimmed);
     }
   }
 
-  result.intro = introLines.join(" ");
+  const intro = introLines.join(" ");
+  const days: ParsedDay[] = [];
 
-  // Parse Days 1-5
   const dayRegex = /(?:^|\n)##\s*Day\s*(\d+)/gi;
   const dayMatches = Array.from(markdown.matchAll(dayRegex));
 
@@ -89,7 +63,6 @@ export function parseMealPlanMarkdown(markdown: string): ParsedPlan {
     if (d + 1 < dayMatches.length) {
       endIndex = dayMatches[d + 1].index!;
     } else {
-      // Look for next top header
       const nextHeader = markdown.slice(startIndex).search(/\n#\s+/);
       if (nextHeader !== -1) {
         endIndex = startIndex + nextHeader;
@@ -100,49 +73,109 @@ export function parseMealPlanMarkdown(markdown: string): ParsedPlan {
     const parsedDay: ParsedDay = {
       dayNumber: dayNum,
       dayTitle: `Day ${dayNum}`,
+      breakfast: parseMealFromChunk(dayChunk, "Breakfast"),
+      lunch: parseMealFromChunk(dayChunk, "Lunch"),
+      dinner: parseMealFromChunk(dayChunk, "Dinner"),
     };
 
-    // Extract Breakfast, Lunch, Dinner
-    parsedDay.breakfast = parseMealFromChunk(dayChunk, "Breakfast");
-    parsedDay.lunch = parseMealFromChunk(dayChunk, "Lunch");
-    parsedDay.dinner = parseMealFromChunk(dayChunk, "Dinner");
-
-    result.days.push(parsedDay);
+    days.push(parsedDay);
   }
 
-  // Parse Prep Strategy items
+  return { intro, days };
+}
+
+export function parsePrepSection(markdown: string): string[] {
+  if (!markdown) return [];
+
+  const lines = markdown.split("\n");
+  const prepStrategy: string[] = [];
   let currentPrepItem = "";
-  for (const pl of prepLines) {
-    if (pl.startsWith("* ") || pl.startsWith("- ") || /^\d+\.\s/.test(pl)) {
-      if (currentPrepItem) result.prepStrategy.push(currentPrepItem);
-      currentPrepItem = pl.replace(/^[-*]\s+|\d+\.\s+/, "").trim();
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#")) continue;
+
+    if (trimmed.startsWith("* ") || trimmed.startsWith("- ") || /^\d+[\.\)]\s/.test(trimmed)) {
+      if (currentPrepItem) prepStrategy.push(currentPrepItem);
+      currentPrepItem = trimmed.replace(/^[-*]\s+|\d+[\.\)]\s+/, "").trim();
     } else if (currentPrepItem) {
-      currentPrepItem += " " + pl;
-    } else if (pl && !pl.startsWith("#")) {
-      currentPrepItem = pl;
+      currentPrepItem += " " + trimmed;
+    } else if (trimmed.length > 5 && !trimmed.startsWith("---")) {
+      currentPrepItem = trimmed;
     }
   }
-  if (currentPrepItem) result.prepStrategy.push(currentPrepItem);
 
-  // Parse Grocery list categories
+  if (currentPrepItem) prepStrategy.push(currentPrepItem);
+  return prepStrategy;
+}
+
+export function parseGrocerySection(markdown: string): ParsedGroceryCategory[] {
+  if (!markdown) return [];
+
+  const lines = markdown.split("\n");
+  const groceryList: ParsedGroceryCategory[] = [];
   let currentCat: ParsedGroceryCategory | null = null;
-  for (const gl of groceryLines) {
-    if (gl.startsWith("### ") || gl.startsWith("## ") || /^\*\*[^*]+:\*\*/.test(gl)) {
-      const catName = gl.replace(/^#+\s*|\*\*|:/g, "").trim();
-      if (catName) {
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed === "---") continue;
+
+    // Check for category header
+    if (
+      trimmed.startsWith("### ") ||
+      trimmed.startsWith("## ") ||
+      /^\*\*[^*]+:\*\*/.test(trimmed) ||
+      /^(?:Protein|Produce|Dairy|Carbs|Grains|Pantry|Sauces|Flavor|Seasonings)/i.test(trimmed) && trimmed.endsWith(":")
+    ) {
+      const catName = trimmed.replace(/^#+\s*|\*\*|:/g, "").trim();
+      if (catName && !/Grocery List/i.test(catName)) {
         currentCat = { categoryName: catName, items: [] };
-        result.groceryList.push(currentCat);
+        groceryList.push(currentCat);
       }
-    } else if (gl.startsWith("* ") || gl.startsWith("- ") || /^\d+\.\s/.test(gl)) {
-      const item = gl.replace(/^[-*]\s+|\d+\.\s+/, "").trim();
+    } else if (trimmed.startsWith("* ") || trimmed.startsWith("- ") || /^\d+[\.\)]\s/.test(trimmed)) {
+      const item = trimmed.replace(/^[-*]\s+|\d+[\.\)]\s+/, "").trim();
       if (item) {
         if (!currentCat) {
           currentCat = { categoryName: "General", items: [] };
-          result.groceryList.push(currentCat);
+          groceryList.push(currentCat);
         }
         currentCat.items.push(item);
       }
     }
+  }
+
+  return groceryList;
+}
+
+export function parseMealPlanMarkdown(markdown: string): ParsedPlan {
+  const result: ParsedPlan = {
+    intro: "",
+    days: [],
+    prepStrategy: [],
+    groceryList: [],
+    rawMarkdown: markdown,
+  };
+
+  if (!markdown) return result;
+
+  const { intro, days } = parseMealsSection(markdown);
+  result.intro = intro;
+  result.days = days;
+
+  // Locate Prep section
+  const prepIndex = markdown.search(/#+\s*(?:Prep\s+Once|Prep\s+Strategy)/i);
+  const groceryIndex = markdown.search(/#+\s*(?:Your\s+)?(?:5-Day\s+)?Grocery\s+List/i);
+
+  if (prepIndex !== -1) {
+    const prepEnd = groceryIndex !== -1 && groceryIndex > prepIndex ? groceryIndex : markdown.length;
+    const prepChunk = markdown.slice(prepIndex, prepEnd);
+    result.prepStrategy = parsePrepSection(prepChunk);
+  }
+
+  if (groceryIndex !== -1) {
+    const groceryChunk = markdown.slice(groceryIndex);
+    result.groceryList = parseGrocerySection(groceryChunk);
   }
 
   return result;
@@ -156,7 +189,6 @@ function parseMealFromChunk(chunk: string, type: "Breakfast" | "Lunch" | "Dinner
   const mealName = match[1].trim();
   const mealStartIndex = match.index! + match[0].length;
 
-  // Meal ends at the next meal header or end of chunk
   const nextMeal = chunk.slice(mealStartIndex).search(/###\s*(?:Breakfast|Lunch|Dinner)/i);
   const mealText = nextMeal !== -1 ? chunk.slice(mealStartIndex, mealStartIndex + nextMeal) : chunk.slice(mealStartIndex);
 

@@ -1,11 +1,17 @@
 import React, { useState, useEffect } from "react";
-import { IntakeForm, IntakeFormData, INITIAL_INTAKE_FORM } from "./components/IntakeForm";
+import { IntakeForm, IntakeFormData } from "./components/IntakeForm";
 import { MealPlanViewer } from "./components/MealPlanViewer";
 import { GroceryListViewer } from "./components/GroceryListViewer";
 import { PrepStrategyViewer } from "./components/PrepStrategyViewer";
 import { RecipeCatalogModal } from "./components/RecipeCatalogModal";
 import { ChatTweakDrawer, ChatMessage } from "./components/ChatTweakDrawer";
-import { parseMealPlanMarkdown, ParsedPlan } from "./utils/planParser";
+import {
+  parseMealPlanMarkdown,
+  parseMealsSection,
+  parsePrepSection,
+  parseGrocerySection,
+  ParsedPlan,
+} from "./utils/planParser";
 import { ApprovedRecipe } from "./data/mealCoachData";
 import {
   Utensils,
@@ -26,13 +32,23 @@ import {
 const STORAGE_KEY_PLAN = "meal_plan_coach_saved_plan";
 const STORAGE_KEY_MSGS = "meal_plan_coach_saved_msgs";
 
+interface ParallelLoadingState {
+  meals: boolean;
+  prep: boolean;
+  grocery: boolean;
+}
+
 export default function App() {
   const [phase, setPhase] = useState<"intake" | "plan">("intake");
   const [rawPlanMarkdown, setRawPlanMarkdown] = useState<string>("");
   const [parsedPlan, setParsedPlan] = useState<ParsedPlan | null>(null);
   const [activeTab, setActiveTab] = useState<"plan" | "prep" | "grocery" | "markdown">("plan");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [loadingState, setLoadingState] = useState<ParallelLoadingState>({
+    meals: false,
+    prep: false,
+    grocery: false,
+  });
   const [error, setError] = useState<string | null>(null);
   const [debugStatus, setDebugStatus] = useState<string | null>(null);
   const [copiedPlan, setCopiedPlan] = useState(false);
@@ -40,6 +56,8 @@ export default function App() {
   // Modals / Drawers
   const [isRecipeCatalogOpen, setIsRecipeCatalogOpen] = useState(false);
   const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
+
+  const isGenerating = loadingState.meals || loadingState.prep || loadingState.grocery;
 
   // Load saved plan from localStorage on mount
   useEffect(() => {
@@ -96,60 +114,162 @@ export default function App() {
     }
   };
 
+  // Generate plan via 3 parallel requests fired with Promise.all
   const handleGeneratePlan = async (formData: IntakeFormData) => {
     const summary = buildSummaryFromForm(formData);
-    const initialUserMsg = `Here are my meal plan preferences and answers:\n\n${summary}\n\nPlease select 5 breakfasts, 5 lunches, and 5 dinners from the approved knowledge database. Include the Personalized Introduction, the 5-Day Plan, the "Prep Once, Eat Faster" section, and the consolidated "5-Day Grocery List".`;
-
-    const newMsgs: ChatMessage[] = [{ role: "user", content: initialUserMsg }];
-    setChatMessages(newMsgs);
-    setIsLoading(true);
-    setError(null);
     setPhase("plan");
+    setError(null);
+    setLoadingState({ meals: true, prep: true, grocery: true });
+
+    // Initialize parsed plan
+    setParsedPlan({
+      intro: "",
+      days: [],
+      prepStrategy: [],
+      groceryList: [],
+      rawMarkdown: "",
+    });
+
+    const mealsPrompt = `Here are my meal plan preferences and answers:\n\n${summary}\n\nPlease select 5 approved breakfasts, 5 approved lunches, and 5 approved dinners from the knowledge database that personalize to these preferences. Provide the Personalized Introduction and the 5-day meal plan (Day 1 through Day 5, Breakfast, Lunch, Dinner with 'Why you'll like it', 'Why it works', 'What you need', 'Make it', 'Make it easier'). Do NOT include the Prep Once or Grocery List sections in this message.`;
+
+    const prepPrompt = `Here are my meal plan preferences and answers:\n\n${summary}\n\nBased on these preferences and the approved meal database, generate ONLY the "# Prep Once, Eat Faster" section. Provide 4-8 concrete batch-prep actions (e.g. cooking proteins in batch, roasting sweet potatoes, pre-cooking grains, chopping vegetables) and specify which days/meals they support, following the Prep & Grocery rules. Do NOT include meal recipes or grocery lists in this message.`;
+
+    const groceryPrompt = `Here are my meal plan preferences and answers:\n\n${summary}\n\nBased on these preferences and the approved meal database, generate ONLY the "# Your 5-Day Grocery List" section. Consolidate ingredients across meals into practical shopping quantities. Categorize strictly into:\n### Protein\n### Produce\n### Dairy / Refrigerated\n### Carbs / Grains\n### Pantry / Sauces\n### Flavor / Seasonings\nDo NOT include meal recipes or prep instructions in this message.`;
+
+    let mealsText = "";
+    let prepText = "";
+    let groceryText = "";
+
+    // Parallel Request 1: 5-Day Meals
+    const fetchMealsPromise = (async () => {
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [{ role: "user", content: mealsPrompt }] }),
+        });
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || `Meals request failed (${res.status})`);
+        }
+        const data = await res.json();
+        mealsText = data.text || "";
+        const { intro, days } = parseMealsSection(mealsText);
+        setParsedPlan((prev) => ({
+          intro,
+          days,
+          prepStrategy: prev?.prepStrategy || [],
+          groceryList: prev?.groceryList || [],
+          rawMarkdown: prev?.rawMarkdown || "",
+        }));
+      } catch (err: any) {
+        console.error("Meals generation error:", err);
+        throw err;
+      } finally {
+        setLoadingState((prev) => ({ ...prev, meals: false }));
+      }
+    })();
+
+    // Parallel Request 2: Prep Strategy
+    const fetchPrepPromise = (async () => {
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [{ role: "user", content: prepPrompt }] }),
+        });
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || `Prep strategy request failed (${res.status})`);
+        }
+        const data = await res.json();
+        prepText = data.text || "";
+        const prepItems = parsePrepSection(prepText);
+        setParsedPlan((prev) => ({
+          intro: prev?.intro || "",
+          days: prev?.days || [],
+          prepStrategy: prepItems,
+          groceryList: prev?.groceryList || [],
+          rawMarkdown: prev?.rawMarkdown || "",
+        }));
+      } catch (err: any) {
+        console.error("Prep generation error:", err);
+        throw err;
+      } finally {
+        setLoadingState((prev) => ({ ...prev, prep: false }));
+      }
+    })();
+
+    // Parallel Request 3: Grocery List
+    const fetchGroceryPromise = (async () => {
+      try {
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: [{ role: "user", content: groceryPrompt }] }),
+        });
+        if (!res.ok) {
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || `Grocery list request failed (${res.status})`);
+        }
+        const data = await res.json();
+        groceryText = data.text || "";
+        const groceryCategories = parseGrocerySection(groceryText);
+        setParsedPlan((prev) => ({
+          intro: prev?.intro || "",
+          days: prev?.days || [],
+          prepStrategy: prev?.prepStrategy || [],
+          groceryList: groceryCategories,
+          rawMarkdown: prev?.rawMarkdown || "",
+        }));
+      } catch (err: any) {
+        console.error("Grocery generation error:", err);
+        throw err;
+      } finally {
+        setLoadingState((prev) => ({ ...prev, grocery: false }));
+      }
+    })();
 
     try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: newMsgs }),
-      });
+      // All three fired together with Promise.all
+      await Promise.all([fetchMealsPromise, fetchPrepPromise, fetchGroceryPromise]);
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `Server responded with ${response.status}`);
-      }
+      const combinedMarkdown = [mealsText, prepText, groceryText]
+        .filter(Boolean)
+        .join("\n\n---\n\n");
+      setRawPlanMarkdown(combinedMarkdown);
+      setParsedPlan((prev) => ({
+        ...prev!,
+        rawMarkdown: combinedMarkdown,
+      }));
 
-      const data = await response.json();
-      const planMarkdown = data.text || "";
-
-      setRawPlanMarkdown(planMarkdown);
-      const parsed = parseMealPlanMarkdown(planMarkdown);
-      setParsedPlan(parsed);
-
+      const initialUserMsg = `Here are my meal plan preferences and answers:\n\n${summary}\n\nPlease build my 5-day plan, prep strategy, and grocery list.`;
       const updatedMsgs: ChatMessage[] = [
-        ...newMsgs,
-        { role: "assistant", content: planMarkdown },
+        { role: "user", content: initialUserMsg },
+        { role: "assistant", content: combinedMarkdown },
       ];
       setChatMessages(updatedMsgs);
 
       // Save to localStorage
       try {
-        localStorage.setItem(STORAGE_KEY_PLAN, planMarkdown);
+        localStorage.setItem(STORAGE_KEY_PLAN, combinedMarkdown);
         localStorage.setItem(STORAGE_KEY_MSGS, JSON.stringify(updatedMsgs));
       } catch (_) {}
     } catch (err: any) {
-      console.error("Failed to generate plan:", err);
-      setError(err?.message || "Something went wrong while contacting the coach. Please try again.");
-    } finally {
-      setIsLoading(false);
+      console.error("Parallel generation error:", err);
+      setError(
+        err?.message ||
+          "One or more sections encountered an error. You can ask for a tweak in Coach Chat or try again."
+      );
     }
   };
 
   const handleSendMessage = async (text: string) => {
-    if (!text.trim() || isLoading) return;
+    if (!text.trim() || isGenerating) return;
 
     const nextMsgs: ChatMessage[] = [...chatMessages, { role: "user", content: text }];
     setChatMessages(nextMsgs);
-    setIsLoading(true);
+    setLoadingState({ meals: true, prep: false, grocery: false });
     setError(null);
 
     try {
@@ -189,7 +309,7 @@ export default function App() {
       console.error("Chat message error:", err);
       setError(err?.message || "Failed to communicate with the coach.");
     } finally {
-      setIsLoading(false);
+      setLoadingState({ meals: false, prep: false, grocery: false });
     }
   };
 
@@ -226,6 +346,7 @@ export default function App() {
       setParsedPlan(null);
       setChatMessages([]);
       setError(null);
+      setLoadingState({ meals: false, prep: false, grocery: false });
       try {
         localStorage.removeItem(STORAGE_KEY_PLAN);
         localStorage.removeItem(STORAGE_KEY_MSGS);
@@ -325,7 +446,7 @@ export default function App() {
           <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs flex items-start gap-2.5">
             <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
             <div>
-              <p className="font-semibold">Plan Generation Error</p>
+              <p className="font-semibold">Plan Generation Notice</p>
               <p className="text-red-700 mt-0.5">{error}</p>
             </div>
           </div>
@@ -335,9 +456,61 @@ export default function App() {
       {/* Main Content Area */}
       <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
         {phase === "intake" ? (
-          <IntakeForm onSubmit={handleGeneratePlan} isLoading={isLoading} />
+          <IntakeForm onSubmit={handleGeneratePlan} isLoading={isGenerating} />
         ) : (
           <div>
+            {/* Parallel Progress Banner */}
+            {isGenerating && (
+              <div className="mb-6 p-4 rounded-xl bg-gradient-to-r from-emerald-50 via-amber-50/40 to-emerald-50 border border-emerald-200 flex flex-wrap items-center justify-between gap-3 text-xs text-stone-800 animate-in fade-in">
+                <div className="flex items-center gap-2">
+                  <span className="w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin shrink-0" />
+                  <span className="font-semibold text-emerald-950">
+                    Generating plan in parallel streams (Low Latency):
+                  </span>
+                </div>
+                <div className="flex items-center gap-3 text-xs">
+                  <span
+                    className={`flex items-center gap-1.5 ${
+                      loadingState.meals ? "text-stone-500 font-medium" : "text-emerald-700 font-semibold"
+                    }`}
+                  >
+                    {loadingState.meals ? (
+                      <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    ) : (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    )}
+                    5-Day Meals
+                  </span>
+                  <span className="text-stone-300">•</span>
+                  <span
+                    className={`flex items-center gap-1.5 ${
+                      loadingState.prep ? "text-stone-500 font-medium" : "text-emerald-700 font-semibold"
+                    }`}
+                  >
+                    {loadingState.prep ? (
+                      <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    ) : (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    )}
+                    Prep Strategy
+                  </span>
+                  <span className="text-stone-300">•</span>
+                  <span
+                    className={`flex items-center gap-1.5 ${
+                      loadingState.grocery ? "text-stone-500 font-medium" : "text-emerald-700 font-semibold"
+                    }`}
+                  >
+                    {loadingState.grocery ? (
+                      <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                    ) : (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    )}
+                    Grocery List
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Plan View Navigation Tabs */}
             <div className="flex flex-wrap items-center justify-between gap-3 mb-6 pb-4 border-b border-stone-200">
               <div className="flex items-center gap-1.5 bg-stone-200/70 p-1 rounded-xl">
@@ -349,8 +522,17 @@ export default function App() {
                       : "text-stone-600 hover:text-stone-900"
                   }`}
                 >
-                  <Calendar className="w-3.5 h-3.5 text-emerald-700" />
-                  5-Day Meals
+                  {loadingState.meals ? (
+                    <span className="w-3 h-3 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Calendar className="w-3.5 h-3.5 text-emerald-700" />
+                  )}
+                  <span>5-Day Meals</span>
+                  {loadingState.meals && (
+                    <span className="text-[10px] text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded-md font-normal">
+                      Loading
+                    </span>
+                  )}
                 </button>
 
                 <button
@@ -361,8 +543,17 @@ export default function App() {
                       : "text-stone-600 hover:text-stone-900"
                   }`}
                 >
-                  <Zap className="w-3.5 h-3.5 text-amber-600" />
-                  Prep Strategy
+                  {loadingState.prep ? (
+                    <span className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <Zap className="w-3.5 h-3.5 text-amber-600" />
+                  )}
+                  <span>Prep Strategy</span>
+                  {loadingState.prep && (
+                    <span className="text-[10px] text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded-md font-normal">
+                      Loading
+                    </span>
+                  )}
                 </button>
 
                 <button
@@ -373,8 +564,17 @@ export default function App() {
                       : "text-stone-600 hover:text-stone-900"
                   }`}
                 >
-                  <ShoppingBag className="w-3.5 h-3.5 text-emerald-700" />
-                  Grocery List
+                  {loadingState.grocery ? (
+                    <span className="w-3 h-3 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <ShoppingBag className="w-3.5 h-3.5 text-emerald-700" />
+                  )}
+                  <span>Grocery List</span>
+                  {loadingState.grocery && (
+                    <span className="text-[10px] text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded-md font-normal">
+                      Loading
+                    </span>
+                  )}
                 </button>
 
                 <button
@@ -393,7 +593,8 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <button
                   onClick={handleCopyPlan}
-                  className="px-3 py-1.5 rounded-lg border border-stone-200 bg-white hover:bg-stone-50 text-stone-700 text-xs font-medium flex items-center gap-1.5 transition"
+                  disabled={isGenerating}
+                  className="px-3 py-1.5 rounded-lg border border-stone-200 bg-white hover:bg-stone-50 disabled:opacity-50 text-stone-700 text-xs font-medium flex items-center gap-1.5 transition"
                 >
                   {copiedPlan ? (
                     <Check className="w-3.5 h-3.5 text-emerald-600" />
@@ -405,18 +606,17 @@ export default function App() {
               </div>
             </div>
 
-            {/* Loading state indicator */}
-            {isLoading && (
-              <div className="mb-6 p-4 rounded-xl bg-emerald-50 border border-emerald-200 flex items-center gap-3 text-xs text-emerald-900">
-                <span className="w-4 h-4 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin shrink-0" />
-                <span>Coach is generating your personalized 5-day plan and grocery schedule...</span>
-              </div>
-            )}
-
             {/* Tab Views */}
             {activeTab === "plan" && (
               <div className="space-y-6">
-                {parsedPlan ? (
+                {loadingState.meals && (!parsedPlan?.days || parsedPlan.days.length === 0) ? (
+                  <div className="p-12 text-center bg-white rounded-2xl border border-stone-200 shadow-2xs space-y-3">
+                    <span className="w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin inline-block" />
+                    <p className="text-xs text-stone-600 font-medium">
+                      Coach is selecting 15 approved recipes and tailoring daily portions...
+                    </p>
+                  </div>
+                ) : parsedPlan?.days && parsedPlan.days.length > 0 ? (
                   <MealPlanViewer
                     days={parsedPlan.days}
                     intro={parsedPlan.intro}
@@ -424,7 +624,7 @@ export default function App() {
                   />
                 ) : (
                   <div className="p-8 text-center text-stone-500 bg-white rounded-2xl border border-stone-200">
-                    Generating plan...
+                    No meals parsed yet.
                   </div>
                 )}
               </div>
@@ -432,7 +632,14 @@ export default function App() {
 
             {activeTab === "prep" && (
               <div>
-                {parsedPlan?.prepStrategy && parsedPlan.prepStrategy.length > 0 ? (
+                {loadingState.prep && (!parsedPlan?.prepStrategy || parsedPlan.prepStrategy.length === 0) ? (
+                  <div className="p-12 text-center bg-white rounded-2xl border border-stone-200 shadow-2xs space-y-3">
+                    <span className="w-6 h-6 border-2 border-amber-600 border-t-transparent rounded-full animate-spin inline-block" />
+                    <p className="text-xs text-stone-600 font-medium">
+                      Coach is calculating overlapping ingredients and batch prep actions...
+                    </p>
+                  </div>
+                ) : parsedPlan?.prepStrategy && parsedPlan.prepStrategy.length > 0 ? (
                   <PrepStrategyViewer prepItems={parsedPlan.prepStrategy} />
                 ) : (
                   <div className="bg-white rounded-2xl border border-stone-200 p-8 text-center text-stone-500">
@@ -444,7 +651,14 @@ export default function App() {
 
             {activeTab === "grocery" && (
               <div>
-                {parsedPlan?.groceryList ? (
+                {loadingState.grocery && (!parsedPlan?.groceryList || parsedPlan.groceryList.length === 0) ? (
+                  <div className="p-12 text-center bg-white rounded-2xl border border-stone-200 shadow-2xs space-y-3">
+                    <span className="w-6 h-6 border-2 border-emerald-600 border-t-transparent rounded-full animate-spin inline-block" />
+                    <p className="text-xs text-stone-600 font-medium">
+                      Coach is consolidating grocery ingredients into shopping categories...
+                    </p>
+                  </div>
+                ) : parsedPlan?.groceryList && parsedPlan.groceryList.length > 0 ? (
                   <GroceryListViewer categories={parsedPlan.groceryList} />
                 ) : (
                   <div className="bg-white rounded-2xl border border-stone-200 p-8 text-center text-stone-500">
@@ -457,7 +671,10 @@ export default function App() {
             {activeTab === "markdown" && (
               <div className="bg-white rounded-2xl border border-stone-200 p-6 sm:p-8 shadow-xs">
                 <div className="prose prose-stone max-w-none text-xs sm:text-sm leading-relaxed whitespace-pre-wrap font-mono bg-stone-50 p-4 rounded-xl border border-stone-200">
-                  {rawPlanMarkdown || "No plan generated yet."}
+                  {rawPlanMarkdown ||
+                    (isGenerating
+                      ? "Plan is streaming in parallel streams... check individual tabs above."
+                      : "No plan generated yet.")}
                 </div>
               </div>
             )}
@@ -467,7 +684,7 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-auto border-t border-stone-200 bg-white py-4 text-center text-xs text-stone-400">
-        5-Day Meal Plan Coach • Powered by Gemini 3.8 Flash • Designed for simplicity, speed, and real-life adherence
+        5-Day Meal Plan Coach • Powered by Gemini 3.5 Flash • Low-latency parallel generation
       </footer>
 
       {/* Modals & Drawers */}
@@ -482,7 +699,7 @@ export default function App() {
         onClose={() => setIsChatDrawerOpen(false)}
         messages={chatMessages}
         onSendMessage={handleSendMessage}
-        isLoading={isLoading}
+        isLoading={isGenerating}
       />
     </div>
   );

@@ -2,7 +2,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import dotenv from "dotenv";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { SYSTEM_PROMPT } from "./src/data/mealCoachData.ts";
 
 dotenv.config();
@@ -70,6 +70,9 @@ app.post("/api/chat", async (req, res) => {
           config: {
             systemInstruction: SYSTEM_PROMPT,
             temperature: 0.4,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
           },
         });
         if (response.text) {

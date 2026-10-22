@@ -1,4 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 export const config = {
   path: "/api/chat",
@@ -325,6 +325,9 @@ export default async function handler(req) {
           config: {
             systemInstruction: SYSTEM_PROMPT,
             temperature: 0.4,
+            thinkingConfig: {
+              thinkingLevel: ThinkingLevel.LOW,
+            },
           },
         });
         if (response.text) {
